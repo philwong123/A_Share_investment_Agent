@@ -1,10 +1,10 @@
 import os
 import time
 import logging
-from google import genai
 from dotenv import load_dotenv
-from dataclasses import dataclass
-import backoff
+import requests
+import json
+from typing import Optional, Dict, Any
 
 # 设置日志记录
 logger = logging.getLogger('api_calls')
@@ -53,22 +53,6 @@ SUCCESS_ICON = "✓"
 ERROR_ICON = "✗"
 WAIT_ICON = "⟳"
 
-
-@dataclass
-class ChatMessage:
-    content: str
-
-
-@dataclass
-class ChatChoice:
-    message: ChatMessage
-
-
-@dataclass
-class ChatCompletion:
-    choices: list[ChatChoice]
-
-
 # 获取项目根目录
 project_root = os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__))))
@@ -81,123 +65,133 @@ if os.path.exists(env_path):
 else:
     logger.warning(f"{ERROR_ICON} 未找到环境变量文件: {env_path}")
 
-# 验证环境变量
-api_key = os.getenv("GEMINI_API_KEY")
-model = os.getenv("GEMINI_MODEL")
+# 定义模型提供商
+class AIProvider:
+    GEMINI = "gemini"
+    ZHIPU = "zhipu"  # 智谱AI
 
-if not api_key:
-    logger.error(f"{ERROR_ICON} 未找到 GEMINI_API_KEY 环境变量")
-    raise ValueError("GEMINI_API_KEY not found in environment variables")
-if not model:
-    model = "gemini-1.5-flash"
-    logger.info(f"{WAIT_ICON} 使用默认模型: {model}")
+# 配置
+DEFAULT_PROVIDER = os.getenv("DEFAULT_AI_PROVIDER", AIProvider.ZHIPU)
+ZHIPU_API_KEY = os.getenv("ZHIPU_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# 初始化 Gemini 客户端
-client = genai.Client(api_key=api_key)
-logger.info(f"{SUCCESS_ICON} Gemini 客户端初始化成功")
+class AIService:
+    def __init__(self):
+        self.current_provider = DEFAULT_PROVIDER
+        
+        # 初始化智谱AI
+        if ZHIPU_API_KEY:
+            self.zhipu_headers = {
+                "Authorization": f"Bearer {ZHIPU_API_KEY}",
+                "Content-Type": "application/json"
+            }
+        else:
+            logger.warning(f"{ERROR_ICON} 未找到 ZHIPU_API_KEY")
+            
+        # 初始化Gemini（作为备选）
+        if GEMINI_API_KEY:
+            try:
+                import google.generativeai as genai
+                genai.configure(api_key=GEMINI_API_KEY)
+                self.gemini_model = genai.GenerativeModel("gemini-1.5-pro")
+                logger.info(f"{SUCCESS_ICON} Gemini初始化成功")
+            except Exception as e:
+                logger.warning(f"{ERROR_ICON} Gemini初始化失败: {str(e)}")
+                self.gemini_model = None
+    
+    def generate_content(self, prompt: str) -> Optional[str]:
+        """生成内容，支持故障转移"""
+        if self.current_provider == AIProvider.ZHIPU:
+            try:
+                return self._zhipu_generate(prompt)
+            except Exception as e:
+                logger.error(f"{ERROR_ICON} 智谱AI调用失败: {str(e)}")
+                if self.gemini_model:
+                    logger.info(f"{WAIT_ICON} 尝试切换到Gemini...")
+                    self.current_provider = AIProvider.GEMINI
+                    return self.generate_content(prompt)
+                return None
+        else:
+            try:
+                return self._gemini_generate(prompt)
+            except Exception as e:
+                logger.error(f"{ERROR_ICON} Gemini调用失败: {str(e)}")
+                self.current_provider = AIProvider.ZHIPU
+                return self.generate_content(prompt)
 
+    def _zhipu_generate(self, prompt: str) -> Optional[str]:
+        """调用智谱AI API"""
+        url = "https://open.bigmodel.cn/api/paas/v3/model-api/chatglm_turbo/invoke"
+        
+        payload = {
+            "prompt": prompt,
+            "temperature": 0.7,
+            "top_p": 0.7,
+            "request_id": f"request_{int(time.time())}"
+        }
+        
+        try:
+            response = requests.post(url, headers=self.zhipu_headers, json=payload)
+            response.raise_for_status()
+            result = response.json()
+            
+            if "data" in result and "choices" in result["data"]:
+                return result["data"]["choices"][0]["content"]
+            else:
+                logger.error(f"{ERROR_ICON} 智谱AI返回异常响应: {result}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"{ERROR_ICON} 智谱AI API调用失败: {str(e)}")
+            raise
 
-@backoff.on_exception(
-    backoff.expo,
-    (Exception),
-    max_tries=5,
-    max_time=300,
-    giveup=lambda e: "AFC is enabled" not in str(e)
-)
-def generate_content_with_retry(model, contents, config=None):
-    """带重试机制的内容生成函数"""
-    try:
-        logger.info(f"{WAIT_ICON} 正在调用 Gemini API...")
-        logger.info(f"请求内容: {contents[:500]}..." if len(
-            str(contents)) > 500 else f"请求内容: {contents}")
-        logger.info(f"请求配置: {config}")
+    def _gemini_generate(self, prompt: str) -> Optional[str]:
+        """调用Gemini API"""
+        try:
+            response = self.gemini_model.generate_content(prompt)
+            return response.text if response and hasattr(response, 'text') else None
+        except Exception as e:
+            logger.error(f"{ERROR_ICON} Gemini API调用失败: {str(e)}")
+            raise
 
-        response = client.models.generate_content(
-            model=model,
-            contents=contents,
-            config=config
-        )
-
-        logger.info(f"{SUCCESS_ICON} API 调用成功")
-        logger.info(f"响应内容: {response.text[:500]}..." if len(
-            str(response.text)) > 500 else f"响应内容: {response.text}")
-        return response
-    except Exception as e:
-        if "AFC is enabled" in str(e):
-            logger.warning(f"{ERROR_ICON} 触发 API 限制，等待重试... 错误: {str(e)}")
-            time.sleep(5)
-            raise e
-        logger.error(f"{ERROR_ICON} API 调用失败: {str(e)}")
-        logger.error(f"错误详情: {str(e)}")
-        raise e
-
+# 创建全局AI服务实例
+ai_service = AIService()
 
 def get_chat_completion(messages, model=None, max_retries=3, initial_retry_delay=1):
-    """获取聊天完成结果，包含重试逻辑"""
+    """获取聊天完成结果"""
     try:
-        if model is None:
-            model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+        # 转换消息格式
+        prompt = ""
+        for message in messages:
+            role = message["role"]
+            content = message["content"]
+            if role == "system":
+                prompt += f"System: {content}\n"
+            elif role == "user":
+                prompt += f"User: {content}\n"
+            elif role == "assistant":
+                prompt += f"Assistant: {content}\n"
 
-        logger.info(f"{WAIT_ICON} 使用模型: {model}")
-        logger.debug(f"消息内容: {messages}")
-
+        # 调用AI服务
         for attempt in range(max_retries):
             try:
-                # 转换消息格式
-                prompt = ""
-                system_instruction = None
-
-                for message in messages:
-                    role = message["role"]
-                    content = message["content"]
-                    if role == "system":
-                        system_instruction = content
-                    elif role == "user":
-                        prompt += f"User: {content}\n"
-                    elif role == "assistant":
-                        prompt += f"Assistant: {content}\n"
-
-                # 准备配置
-                config = {}
-                if system_instruction:
-                    config['system_instruction'] = system_instruction
-
-                # 调用 API
-                response = generate_content_with_retry(
-                    model=model,
-                    contents=prompt.strip(),
-                    config=config
-                )
-
-                if response is None:
-                    logger.warning(
-                        f"{ERROR_ICON} 尝试 {attempt + 1}/{max_retries}: API 返回空值")
-                    if attempt < max_retries - 1:
-                        retry_delay = initial_retry_delay * (2 ** attempt)
-                        logger.info(f"{WAIT_ICON} 等待 {retry_delay} 秒后重试...")
-                        time.sleep(retry_delay)
-                        continue
-                    return None
-
-                # 转换响应格式
-                chat_message = ChatMessage(content=response.text)
-                chat_choice = ChatChoice(message=chat_message)
-                completion = ChatCompletion(choices=[chat_choice])
-
-                logger.debug(f"API 原始响应: {response.text}")
-                logger.info(f"{SUCCESS_ICON} 成功获取响应")
-                return completion.choices[0].message.content
-
-            except Exception as e:
-                logger.error(
-                    f"{ERROR_ICON} 尝试 {attempt + 1}/{max_retries} 失败: {str(e)}")
+                response = ai_service.generate_content(prompt.strip())
+                if response:
+                    return response
+                
                 if attempt < max_retries - 1:
                     retry_delay = initial_retry_delay * (2 ** attempt)
                     logger.info(f"{WAIT_ICON} 等待 {retry_delay} 秒后重试...")
                     time.sleep(retry_delay)
-                else:
-                    logger.error(f"{ERROR_ICON} 最终错误: {str(e)}")
-                    return None
+                    
+            except Exception as e:
+                logger.error(f"{ERROR_ICON} 尝试 {attempt + 1}/{max_retries} 失败: {str(e)}")
+                if attempt < max_retries - 1:
+                    retry_delay = initial_retry_delay * (2 ** attempt)
+                    logger.info(f"{WAIT_ICON} 等待 {retry_delay} 秒后重试...")
+                    time.sleep(retry_delay)
+
+        return None
 
     except Exception as e:
         logger.error(f"{ERROR_ICON} get_chat_completion 发生错误: {str(e)}")

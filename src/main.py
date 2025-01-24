@@ -1,17 +1,140 @@
 from datetime import datetime, timedelta
 import argparse
-from src.agents.valuation import valuation_agent
-from src.agents.state import AgentState
-from src.agents.sentiment import sentiment_agent
-from src.agents.risk_manager import risk_management_agent
-from src.agents.technicals import technical_analyst_agent
-from src.agents.portfolio_manager import portfolio_management_agent
-from src.agents.market_data import market_data_agent
-from src.agents.fundamentals import fundamentals_agent
+from agents.valuation import valuation_agent
+from agents.state import AgentState
+from agents.sentiment import sentiment_agent
+from agents.risk_manager import risk_management_agent
+from agents.technicals import technical_analyst_agent
+from agents.portfolio_manager import portfolio_management_agent
+from agents.market_data import market_data_agent
+from agents.fundamentals import fundamentals_agent
 from langgraph.graph import END, StateGraph
 from langchain_core.messages import HumanMessage
 import akshare as ak
 import pandas as pd
+import json
+
+
+def format_trading_result(result_str: str) -> None:
+    """美化并翻译交易结果"""
+    try:
+        print("开始处理交易结果...")
+        # 更完整的字符串清理
+        cleaned_str = result_str.strip('"')  # 移除外层的引号
+        if cleaned_str.startswith('```'):
+            print("检测到Markdown代码块，正在清理...")
+            # 移除```json标记和结尾的```
+            cleaned_str = cleaned_str.replace('```json', '')
+            cleaned_str = cleaned_str.replace('```', '')
+            cleaned_str = cleaned_str.strip()
+        
+        # 处理转义字符
+        cleaned_str = cleaned_str.replace('\\n', '\n')
+        cleaned_str = cleaned_str.replace('\\"', '"')
+        
+        print(f"清理后的JSON字符串:\n{cleaned_str}")
+        
+        # 解析JSON字符串
+        result = json.loads(cleaned_str)
+        print("JSON解析成功")
+        
+        # 交易动作翻译映射
+        action_map = {
+            "buy": "买入",
+            "sell": "卖出",
+            "hold": "持有"
+        }
+        
+        # 信号翻译映射
+        signal_map = {
+            "bullish": "看涨",
+            "bearish": "看跌",
+            "neutral": "中性"
+        }
+        
+        # 代理名称翻译映射
+        agent_map = {
+            "Technical Analysis": "技术分析",
+            "Fundamental Analysis": "基本面分析",
+            "Sentiment Analysis": "情绪分析",
+            "Valuation Analysis": "估值分析",
+            "Risk Management": "风险管理"
+        }
+        
+        print("\n========== 交易决策结果 ==========")
+        print(f"交易动作: {action_map.get(result['action'], result['action'])}")
+        print(f"交易数量: {result['quantity']}")
+        print(f"决策置信度: {result['confidence']*100:.0f}%")
+        
+        print("\n各分析师意见:")
+        for signal in result['agent_signals']:
+            confidence = f"{signal['confidence']*100:.0f}%" if signal['confidence'] is not None else "N/A"
+            print(f"- {agent_map.get(signal['agent_name'], signal['agent_name'])}: "
+                  f"{signal_map.get(signal['signal'], signal['signal'])} "
+                  f"(置信度: {confidence})")
+        
+        print("\n决策理由:")
+        # 使用智谱AI翻译决策理由
+        reasoning_en = result['reasoning']
+        reasoning_zh = translate_to_chinese(reasoning_en)  # 添加翻译功能
+        print(reasoning_zh)
+        print("================================")
+        
+    except json.JSONDecodeError as e:
+        print(f"结果格式化失败，JSON解析错误: {str(e)}")
+        print("清理后的字符串：")
+        print(cleaned_str)
+        print("\n原始结果：")
+        print(result_str)
+    except Exception as e:
+        print(f"结果处理时发生错误: {str(e)}")
+        print(f"错误类型: {type(e)}")
+        print(f"错误位置: {e.__traceback__.tb_lineno}")
+        print("原始结果：")
+        print(result_str)
+
+def translate_to_chinese(text: str) -> str:
+    """使用智谱AI翻译英文文本到中文"""
+    try:
+        print("\n开始翻译文本...")
+        from tools.openrouter_config import ai_service
+        
+        prompt = f"""
+        请将以下英文文本翻译成中文，保持专业性和准确性：
+        
+        {text}
+        
+        只需要返回翻译结果，不要包含原文或其他解释。
+        """
+        
+        print("调用AI服务...")
+        response = ai_service.generate_content(prompt.strip())
+        print(f"AI服务响应类型: {type(response)}")
+        print(f"AI服务响应内容: {response}")
+        
+        if not response:
+            print("翻译服务返回空响应")
+            return text
+            
+        # 如果response是字符串，直接返回
+        if isinstance(response, str):
+            print("响应是字符串类型")
+            return response
+            
+        # 如果response是其他类型的对象，尝试获取text属性
+        if hasattr(response, 'text'):
+            print("响应对象具有text属性")
+            return response.text
+            
+        # 如果都不是，返回原文
+        print(f"无法解析翻译响应: {response}")
+        return text
+        
+    except Exception as e:
+        print(f"翻译失败: {str(e)}")
+        print(f"错误类型: {type(e)}")
+        print(f"错误位置: {e.__traceback__.tb_lineno}")
+        return text  # 如果翻译失败，返回原文
 
 
 ##### Run the Hedge Fund #####
@@ -122,8 +245,8 @@ if __name__ == "__main__":
         show_reasoning=args.show_reasoning,
         num_of_news=args.num_of_news
     )
-    print("\nFinal Result:")
-    print(result)
+    
+    format_trading_result(result)
 
 
 def get_historical_data(symbol: str) -> pd.DataFrame:
